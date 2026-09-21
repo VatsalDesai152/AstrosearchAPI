@@ -1,12 +1,30 @@
 # AstroSearch
 
+## Astronomical Summarizer and MIT CSAIL Mantis
+
+Object and extrasolar-system summaries, complete Exoplanet Archive ingestion, SIMBAD host identity cross-references, typed Mantis map exports, and recurring refresh support are documented in [ASTRONOMY.md](ASTRONOMY.md).
+
+Time-series and spectral ingestion, versioned signal vectors, Mantis similarity maps, and scientifically bounded novelty triage are documented in [SIGNAL_REPRESENTATIONS.md](SIGNAL_REPRESENTATIONS.md).
+
+The `mantis-extension/astrosearch-observatory` package adds an organized Mantis mission-control dashboard for the catalog, Gaia, sky-coordinate, and TESS research layers.
+
+```sh
+pip install -e '.[dev]'
+python -m astronomy_pipeline summarize TRAPPIST-1
+python -m astronomy_pipeline sync
+python -m astronomy_pipeline publish
+python -m signal_pipeline telescope-delivery.jsonl --references known-signal-references.json
+```
+
+Mantis publication requires a valid local `mantis setup` connection. The summary and data pipeline work independently of Mantis authentication.
+
 **AstroSearch** is a high-performance Python backend system for cross-matching sky coordinates and astronomical object identities across major public astronomical survey archives (Gaia, SIMBAD, NED, 2MASS, AllWISE, Pan-STARRS, SDSS, FIRST, NVSS, Chandra, XMM, etc.), applying astrophysical filters, and generating streaming datasets in JSON, CSV, Parquet, and FITS formats.
 
-The entire codebase is organized into **6 production-grade monolithic scripts**, providing complete architectural clarity, maximum execution speed, and self-contained operation.
+The backend has six core modules plus dedicated astronomy summary and catalog pipeline modules.
 
 ---
 
-## 🏛️ Architecture: The 6 Monolithic Scripts
+## 🏛️ Architecture
 
 ```
 AstroSearch/
@@ -15,7 +33,12 @@ AstroSearch/
 ├── crossmatch.py     # 3. Query DSL, Proper-Motion Propagation, DSU Grouping & Matching Engine
 ├── datasets.py       # 4. Streaming Dataset Exports (JSON/CSV/Parquet/FITS), Storage & Jobs
 ├── api.py            # 5. Production FastAPI REST Service (Auth, Quotas, Metrics, 15 Endpoints)
-└── main.py           # 6. Master Programmatic Facade, Unified CLI & Built-in Verification
+├── main.py           # 6. Master Programmatic Facade, Unified CLI & Built-in Verification
+├── astronomy.py      # Evidence-based summaries, Exoplanet Archive and SIMBAD identity matching
+├── astronomy_pipeline.py # Atomic snapshots, Mantis exports, publication and refresh CLI
+├── representations.py # Light-curve/spectrum vectors and evidence-bounded novelty triage
+├── signal_pipeline.py # Immutable telescope deliveries and Mantis signal exports
+└── tess_adapter.py    # TESS SPOC FITS to canonical signal observations
 ```
 
 1. **[models.py](models.py)**: Dataclasses (`Target`, `CatalogSource`, `UnifiedRecord`), Astropy spherical coordinate normalization, field normalizers mapping 30+ column aliases, multi-format response parsers (VOTable, IPAC ASCII, CSV, JSON), runtime settings, and the complete embedded 19-catalog registry.
@@ -33,8 +56,8 @@ Requires **Python 3.12+**.
 
 ```bash
 # Clone and enter workspace
-git clone https://github.com/your-org/AstroSearch.git
-cd AstroSearch
+git clone --branch codex/astronomy-mantis https://github.com/FungousLand1941/AstrosearchAPI.git
+cd AstrosearchAPI
 
 # Create virtual environment
 python -m venv .venv
