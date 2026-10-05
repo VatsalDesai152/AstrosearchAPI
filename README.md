@@ -1,53 +1,71 @@
 # AstroSearch
 
+See the [codebase guide](CODEBASE_GUIDE.md) for the seven-module architecture, UI API map, workflows, retained support files, and cleanup boundaries.
+
 ## Astronomical Summarizer and MIT CSAIL Mantis
 
-Object and extrasolar-system summaries, complete Exoplanet Archive ingestion, SIMBAD host identity cross-references, typed Mantis map exports, and recurring refresh support are documented in [ASTRONOMY.md](ASTRONOMY.md).
+Object and extrasolar-system summaries, bounded Exoplanet Archive snapshots, SIMBAD host identity cross-references, typed Mantis map exports, and recurring refresh support are documented in [ASTRONOMY.md](ASTRONOMY.md).
 
 Time-series and spectral ingestion, versioned signal vectors, Mantis similarity maps, and scientifically bounded novelty triage are documented in [SIGNAL_REPRESENTATIONS.md](SIGNAL_REPRESENTATIONS.md).
 
-The `mantis-extension/astrosearch-observatory` package adds an organized Mantis mission-control dashboard for the catalog, Gaia, sky-coordinate, and TESS research layers.
+The `mantis-extension/astrosearch-observatory` directory is currently a manifest/README scaffold. It has no panel source or built panel bundle; see the backend API documentation before implementing a frontend.
+
+Frontend developers can start with the [UI/API integration guide](FRONTEND_INTEGRATION.md) and use the [technical media/API contracts](DOCUMENTATION.md#media-plotting--frontend-integration) for detailed request and response behavior.
 
 ```sh
 pip install -e '.[dev]'
-python -m astronomy_pipeline summarize TRAPPIST-1
-python -m astronomy_pipeline sync
-python -m astronomy_pipeline publish
-python -m signal_pipeline telescope-delivery.jsonl --references known-signal-references.json
+python -m astronomy summarize TRAPPIST-1
+python -m astronomy sync
+python -m astronomy publish
+python -m signals telescope-delivery.jsonl --references known-signal-references.json
+astrosearch-plot-catalogs --name M87 --radius 30 --output-dir plots/m87
+astrosearch-tess retrieve --tic-id 141914082 --sector 1 --jsonl data/tic-141914082.jsonl --plot-dir plots/tic-141914082
 ```
+
+`astrosearch-plot-catalogs` queries the infrared and radio catalog profiles and writes source-position and available catalog measurement plots. Use `--input result.json` (or a CSV, Parquet, or FITS dataset export) to plot saved results without querying archives. TESS SPOC light curves can be retrieved from MAST, cached, returned in the canonical signal format, plotted, or written as JSONL for the signal pipeline. The [technical documentation](DOCUMENTATION.md#media-plotting--frontend-integration) describes supported media, API contracts, cache behavior, and current limitations.
+
+The installed commands remain `astrosearch`, `astrosearch-astronomy`, `astrosearch-signals`, `astrosearch-plot-catalogs`, and `astrosearch-tess`. The corresponding modules are now grouped under the seven-file runtime layout below; use `core`, `signals`, and `tess` for direct imports.
 
 Mantis publication requires a valid local `mantis setup` connection. The summary and data pipeline work independently of Mantis authentication.
 
 **AstroSearch** is a high-performance Python backend system for cross-matching sky coordinates and astronomical object identities across major public astronomical survey archives (Gaia, SIMBAD, NED, 2MASS, AllWISE, Pan-STARRS, SDSS, FIRST, NVSS, Chandra, XMM, etc.), applying astrophysical filters, and generating streaming datasets in JSON, CSV, Parquet, and FITS formats.
 
-The backend has six core modules plus dedicated astronomy summary and catalog pipeline modules.
+The backend runtime is consolidated into seven Python modules. Tests remain under `tests/`.
+
+Dataset requests with `count` use durable canonical records before querying archives. They plan
+missing fields/products, run independent provider tasks, deduplicate and recheck usable coverage,
+then select CSV, Parquet, FITS or JSONL and write a provenance manifest. Requests without `count`
+retain the existing target/detection export behavior. For example:
+
+```sh
+astrosearch dataset --name nearby-stars --profile stellar --catalogs gaia_dr3 --count 100000 --fields ra dec parallax --filters '{"min_parallax": 1}' --format auto
+```
+
+See [dataset fulfillment](DOCUMENTATION.md#7-building-larger-datasets) for the API, exact format
+thresholds, provider budgets, RQ worker setup, persistence schema, and operating limits.
 
 ---
 
-## 🏛️ Architecture
+## Architecture
 
 ```
 AstroSearch/
-├── models.py         # 1. Models, Astrometry, Parsers & Embedded 19-Catalog Registry
-├── providers.py      # 2. Archive Adapters (TAP, Gator, MAST, SDSS, HEASARC), Sesame & Caching
-├── crossmatch.py     # 3. Query DSL, Proper-Motion Propagation, DSU Grouping & Matching Engine
-├── datasets.py       # 4. Streaming Dataset Exports (JSON/CSV/Parquet/FITS), Storage & Jobs
-├── api.py            # 5. Production FastAPI REST Service (Auth, Quotas, Metrics, 15 Endpoints)
-├── main.py           # 6. Master Programmatic Facade, Unified CLI & Built-in Verification
-├── astronomy.py      # Evidence-based summaries, Exoplanet Archive and SIMBAD identity matching
-├── astronomy_pipeline.py # Atomic snapshots, Mantis exports, publication and refresh CLI
-├── representations.py # Light-curve/spectrum vectors and evidence-bounded novelty triage
-├── signal_pipeline.py # Immutable telescope deliveries and Mantis signal exports
-└── tess_adapter.py    # TESS SPOC FITS to canonical signal observations
+|-- core.py      # Models, parsers, providers, query DSL, astrometry, crossmatching
+|-- datasets.py  # Streaming exports, metadata/storage, and worker jobs
+|-- api.py       # FastAPI service, routes, auth, quotas, and metrics
+|-- main.py      # Programmatic facade, search CLI, and offline verification
+|-- astronomy.py # Evidence summaries, snapshots, Mantis publication, catalog plots
+|-- signals.py   # Signal vectors, cross-reference, delivery pipeline, plots
+`-- tess.py      # TESS FITS adapter, MAST retrieval/cache, and CLI
 ```
 
-1. **[models.py](models.py)**: Dataclasses (`Target`, `CatalogSource`, `UnifiedRecord`), Astropy spherical coordinate normalization, field normalizers mapping 30+ column aliases, multi-format response parsers (VOTable, IPAC ASCII, CSV, JSON), runtime settings, and the complete embedded 19-catalog registry.
-2. **[providers.py](providers.py)**: Async HTTP archive adapters for TAP/ADQL, IRSA Gator, MAST, SDSS, and HEASARC Xamin, CDS Sesame name resolver, `EndpointGuard` rate limiter & circuit breaker, and hybrid in-memory / Redis `CacheManager`.
-3. **[crossmatch.py](crossmatch.py)**: `AdvancedQuery` specification, `QueryValidator`, `QueryBuilder`, Astropy proper-motion epoch propagation, probabilistic Gaussian match scoring, adaptive radius density scaling, multi-wavelength Disjoint-Set Union (DSU) counterpart clustering, and `CrossmatchService`.
-4. **[datasets.py](datasets.py)**: High-throughput streaming `DatasetWriter` (`json`, `csv`, `parquet`, `fits`), `DatasetEngine` (multi-target execution, deduplication, detection thresholds), `MetadataStore` (SQLite/PostgreSQL), `ObjectStore` (S3/MinIO), and asynchronous worker jobs.
-5. **[api.py](api.py)**: Full FastAPI REST API with Pydantic request/response schemas, API key and JWT bearer authentication, sliding-window `RequestQuota`, Prometheus metrics (`/api/v1/monitoring/metrics`), structured JSON logging, and 15+ REST endpoints.
-6. **[main.py](main.py)**: High-level Python facade (`crossmatch`, `search_object`, `build_service`), comprehensive unified CLI (`serve`, `search`, `dataset`, `catalogs`, `benchmark`, `verify`), and a built-in offline test suite.
-
+1. **[core.py](core.py)**: Data models, parsing, 16 catalog definitions (15 enabled), archive adapters, name resolver/cache, query validation and planning, proper-motion propagation, scoring, and counterpart grouping.
+2. **[datasets.py](datasets.py)**: Streaming JSON/CSV/Parquet/FITS output, dataset execution, SQLite/PostgreSQL metadata, S3/MinIO storage, and async jobs.
+3. **[api.py](api.py)**: Versioned REST routes for health, catalogs, search, datasets, summaries, signals, TESS, saved queries, and diagnostics, with auth, quotas, and metrics.
+4. **[main.py](main.py)**: Programmatic facade and `astrosearch` CLI (`serve`, `search`, `dataset`, `catalogs`, `benchmark`, `verify`).
+5. **[astronomy.py](astronomy.py)**: Evidence-based object/system summaries, bounded Exoplanet Archive snapshots, SIMBAD identity matching, Mantis export/publication/refresh, and catalog source plots.
+6. **[signals.py](signals.py)**: Fixed 48-value signal representations, evidence-bounded reference matching/triage, immutable telescope deliveries, Mantis signal exports, and quality-aware plots.
+7. **[tess.py](tess.py)**: TESS SPOC FITS conversion, MAST retrieval and cache, canonical observation output, JSONL export, and local/retrieved plotting CLI.
 ---
 
 ## 🚀 Installation
@@ -56,7 +74,7 @@ Requires **Python 3.12+**.
 
 ```bash
 # Clone and enter workspace
-git clone --branch codex/astronomy-mantis https://github.com/FungousLand1941/AstrosearchAPI.git
+git clone https://github.com/FungousLand1941/AstrosearchAPI.git
 cd AstrosearchAPI
 
 # Create virtual environment
@@ -64,7 +82,7 @@ python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\Activate.ps1
 
 # Install dependencies
-pip install -r requirements.txt  # Or: pip install .
+pip install -e '.[dev]'
 ```
 
 ### Key Dependencies
@@ -72,6 +90,7 @@ pip install -r requirements.txt  # Or: pip install .
 - `fastapi>=0.110.0` & `uvicorn>=0.29.0` (REST API service)
 - `pydantic>=2.7.0` (Data validation and schema contracts)
 - `httpx>=0.27.0` (Async HTTP archive client)
+- `astroquery>=0.4.11` (MAST observation and product queries)
 - `pyarrow>=15.0.0` (Streaming Parquet export with zstd compression)
 - `structlog` & `prometheus-client` (Structured observability and metrics)
 - Optional: `redis`, `rq`, `psycopg`, `boto3` (Distributed workers, PostgreSQL, and S3 storage)
@@ -114,7 +133,7 @@ asyncio.run(main())
 ### 3. Advanced Query with Physical and Spatial Filters
 ```python
 import asyncio
-from crossmatch import AdvancedQuery, CrossmatchService
+from core import AdvancedQuery, CrossmatchService
 from main import build_service
 
 async def main():
@@ -173,6 +192,14 @@ python main.py benchmark --rows 50000 --format parquet
 python main.py verify
 ```
 
+### Retrieve, Plot, and Export TESS Light Curves
+```bash
+astrosearch-tess retrieve --tic-id 141914082 --sector 1 --flux-kind PDCSAP_FLUX \
+  --jsonl data/tic-141914082.jsonl --plot-dir plots/tic-141914082
+astrosearch-tess plot sector-1_lc.fits --output-dir plots/local --show-uncertainties
+```
+The retrieval command uses a persistent product cache and writes one canonical JSONL observation per product. See [TESS API and frontend integration](DOCUMENTATION.md#tess-api-contract) for coordinate/name targets, options, payloads, cache behavior, and response statuses.
+
 ---
 
 ## 🌐 HTTP REST API
@@ -182,25 +209,33 @@ The FastAPI service in `api.py` exposes the full REST API:
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/v1/health` | Service health status and timestamp |
-| `GET` | `/api/v1/catalogs` | List all 19 configured astronomical catalogs |
+| `GET` | `/api/v1/catalogs` | List 16 catalog definitions (15 enabled by default) |
 | `GET` | `/api/v1/catalogs/{name}` | Retrieve catalog parameters and table info |
 | `POST` | `/api/v1/search` | Single coordinate or object name crossmatch |
 | `POST` | `/api/v1/search/batch` | Concurrency-limited batch crossmatch |
+| `POST` | `/api/v1/summaries/object` | Summarize crossmatch evidence for an object |
+| `POST` | `/api/v1/summaries/system` | Summarize an extrasolar system |
+| `POST` | `/api/v1/signals/cross-reference` | Represent and compare a supplied light curve or spectrum |
 | `POST` | `/api/v1/datasets/create` | Submit asynchronous dataset creation (HTTP 202) |
 | `GET` | `/api/v1/datasets` | List all created datasets |
 | `GET` | `/api/v1/datasets/{id}` | Inspect dataset generation status & metadata |
 | `GET` | `/api/v1/datasets/{id}/export` | Download dataset (JSON, CSV, Parquet, FITS) |
 | `DELETE` | `/api/v1/datasets/{id}` | Delete dataset and local/S3 artifacts |
 | `GET` | `/api/v1/queries` | List saved queries |
+| `GET` | `/api/v1/queries/{id}` | Retrieve one saved query |
 | `POST` | `/api/v1/queries` | Save query definition |
+| `POST` | `/api/v1/queries/{id}/run` | Run a saved query and return crossmatch JSON |
 | `DELETE` | `/api/v1/queries/{id}` | Delete saved query |
 | `GET` | `/api/v1/stats` | System metrics (datasets, exported sources) |
 | `GET` | `/api/v1/monitoring` | Provider circuit breaker states |
 | `GET` | `/api/v1/monitoring/metrics` | Prometheus scrape endpoint |
+| `POST` | `/api/v1/signals/tess/light-curves` | Retrieve canonical TESS SPOC observations by TIC, name, or coordinates |
+| `POST` | `/api/v1/signals/tess/light-curves/plot` | Retrieve TESS SPOC observations and return a PNG plot |
 
 For detailed API payload specifications, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
 ---
 
-## 📄 License
-MIT License.
+## License
+
+MIT. See [LICENSE](LICENSE).

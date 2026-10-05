@@ -5,9 +5,8 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from representations import VECTOR_SIZE, RepresentationError, cross_reference_observation, mantis_signal_row, represent_signal
-from signal_pipeline import commit_signal_batch
-from tess_adapter import read_tess_light_curve
+from signals import VECTOR_SIZE, RepresentationError, commit_signal_batch, cross_reference_observation, mantis_signal_row, represent_signal
+from tess import read_tess_light_curve
 
 
 def observation(**changes):
@@ -51,6 +50,8 @@ def test_spectrum_uses_physical_axis_bounds_and_rejects_bad_inputs():
         represent_signal(observation(quality=[1] * 64))
     with pytest.raises(RepresentationError, match="coordinates"):
         cross_reference_observation(observation(ra_deg=400), [])
+    with pytest.raises(RepresentationError, match="numeric samples"):
+        represent_signal(observation(values=["bad"] * 64))
 
 
 def test_position_and_representation_are_separate_evidence():
@@ -61,6 +62,9 @@ def test_position_and_representation_are_separate_evidence():
     assert not matched["discovery_claim"]
     position_only = cross_reference_observation(item, [{"catalog_id": "known:1", "ra_deg": 10.0, "dec_deg": 20.0}])
     assert position_only["status"] == "position_only_review"
+    malformed_reference = reference(["not-a-number"] * VECTOR_SIZE)
+    with pytest.raises(RepresentationError, match="numeric values"):
+        cross_reference_observation(item, [malformed_reference])
 
 
 def test_novelty_requires_reference_coverage_and_quality():

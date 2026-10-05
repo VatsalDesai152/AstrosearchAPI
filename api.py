@@ -1,5 +1,7 @@
 """Complete production FastAPI REST API for AstroSearch."""
 
+
+
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +9,7 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -14,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 import structlog
@@ -22,14 +25,23 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, sta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from astronomy import ArchiveError, object_summary, summarize_system
-from crossmatch import AdvancedQuery, CrossmatchService, QueryValidator
+from core import (
+    AdvancedQuery,
+    CacheManager,
+    CatalogRegistry,
+    CrossmatchService,
+    ObjectResolutionError,
+    SesameResolver,
+    Settings,
+    provider_map,
+)
 from datasets import DatasetEngine, MetadataStore, enqueue_dataset, process_dataset_async, submit_to_redis
-from models import CatalogRegistry, Settings
-from providers import CacheManager, SesameResolver, provider_map
-from representations import RepresentationError, cross_reference_observation
+from datasets import DatasetRequest as NormalizedDatasetRequest
+from signals import RepresentationError, cross_reference_observation, plot_light_curves
+from tess import TessLightCurveService, TessServiceError, TessServiceUnavailable
 
 # ---------------------------------------------------------------------------
 # Logging and Prometheus Metrics
@@ -66,12 +78,27 @@ def setup_metrics(application: FastAPI) -> None:
 # ---------------------------------------------------------------------------
 
 
+_QUOTA_WINDOW_SECONDS = 60
+_REDIS_QUOTA_SCRIPT = """
+local now = tonumber(ARGV[1])
+local cutoff = now - tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
+    return 0
+end
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]) * 2000)
+return 1
+"""
+
+
 class RequestQuota:
     """Sliding-window request quota tracker with Redis backend and in-memory fallback."""
 
-    def __init__(self, redis_url: str | None = None) -> None:
+    def __init__(self, redis_url: str | None = None, *, clock: Callable[[], float] = time.time) -> None:
         self._events: dict[str, deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
+        self._clock = clock
         self._redis = None
         if redis_url:
             try:
@@ -83,21 +110,26 @@ class RequestQuota:
     async def allow(self, identity: str, limit: int) -> bool:
         if limit <= 0:
             return True
-        now = time.time()
-        bucket = int(now // 60)
+        now = self._clock()
         if self._redis is not None:
-            key = f"astrosearch:quota:{identity}:{bucket}"
+            key = f"astrosearch:quota:{identity}"
             try:
-                count = await self._redis.incr(key)
-                if count == 1:
-                    await self._redis.expire(key, 120)
-                return count <= limit
+                allowed = await self._redis.eval(
+                    _REDIS_QUOTA_SCRIPT,
+                    1,
+                    key,
+                    now,
+                    _QUOTA_WINDOW_SECONDS,
+                    limit,
+                    f"{now:.9f}:{uuid.uuid4().hex}",
+                )
+                return bool(allowed)
             except Exception as exc:
                 logging.getLogger(__name__).warning("Redis quota unavailable: %s", exc)
 
         async with self._lock:
             events = self._events[identity]
-            while events and events[0] <= now - 60:
+            while events and events[0] <= now - _QUOTA_WINDOW_SECONDS:
                 events.popleft()
             if len(events) >= limit:
                 return False
@@ -175,11 +207,13 @@ async def lifespan(application: FastAPI):
             service=application.state.service,
         )
         application.state.metadata = application.state.engine.metadata
+        application.state.tess_service = TessLightCurveService(os.getenv("TESS_CACHE_DIR"))
         yield
         del application.state.service
         del application.state.client
         del application.state.engine
         del application.state.metadata
+        del application.state.tess_service
         await application.state.quota.close()
 
 
@@ -200,11 +234,13 @@ app.add_middleware(
     allow_credentials="*" not in (cors_origins or ["*"]),
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-AstroSearch-Retrieval-Status", "X-Request-ID"],
 )
 
 setup_metrics(app)
 cache = CacheManager(os.getenv("REDIS_URL"))
 app.state.quota = RequestQuota(os.getenv("REDIS_URL"))
+_TESS_PLOT_LOCK = threading.Lock()
 
 
 def get_service() -> CrossmatchService:
@@ -243,7 +279,12 @@ async def request_metrics(request: Request, call_next):
     if "active_requests" in metrics:
         metrics["active_requests"].labels(endpoint="all").inc()
     try:
-        if endpoint != "/api/v1/health":
+        is_cors_preflight = (
+            request.method == "OPTIONS"
+            and bool(request.headers.get("origin"))
+            and bool(request.headers.get("access-control-request-method"))
+        )
+        if endpoint != "/api/v1/health" and not is_cors_preflight:
             identity = authenticate(request)
             if isinstance(identity, JSONResponse):
                 response = identity
@@ -307,7 +348,7 @@ class TargetRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     ra: float | None = Field(None, description="Right ascension in degrees")
     dec: float | None = Field(None, description="Declination in degrees")
     name: str | None = Field(None, description="Astronomical object name (will be resolved)")
@@ -329,8 +370,29 @@ class SearchRequest(BaseModel):
     min_distance_pc: float | None = Field(None, gt=0)
     max_distance_pc: float | None = Field(None, gt=0)
 
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be blank")
+        return value
 
-class DatasetRequest(BaseModel):
+    @model_validator(mode="after")
+    def validate_target_form(self):
+        has_coordinates = self.ra is not None and self.dec is not None
+        if (self.ra is None) != (self.dec is None):
+            raise ValueError("ra and dec must be supplied together")
+        if self.name is not None and has_coordinates:
+            raise ValueError("provide either name or coordinates, not both")
+        if self.name is None and not has_coordinates:
+            raise ValueError("provide a name or both ra and dec")
+        return self
+
+
+class DatasetRequest(NormalizedDatasetRequest):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., min_length=1, max_length=100)
     profile: str = Field(..., description="Catalog profile to use")
@@ -340,11 +402,22 @@ class DatasetRequest(BaseModel):
     time_period: dict[str, Any] | None = Field(None, description="Time period constraints")
     catalogs: list[str] | None = Field(None, description="Specific catalogs to query")
     filters: dict[str, Any] | None = Field(None, description="Additional filters")
-    export_format: Literal["parquet", "csv", "fits", "json"] = Field("parquet", description="Output format")
+    export_format: Literal["parquet", "csv", "fits", "json", "jsonl", "auto"] | None = None
     output_path: str | None = Field(None, description="Export path for the dataset")
-    targets: list[TargetRequest] = Field(..., min_length=1, description="Sky positions to search")
+    targets: list[dict[str, Any]] = Field(default_factory=list, description="Sky positions; count requests can traverse TAP")
     min_confidence: float = Field(0.0, ge=0, le=1)
     max_results: int | None = Field(None, gt=0)
+
+
+    @model_validator(mode="after")
+    def api_defaults(self):
+        if "count_threshold" not in self.model_fields_set and self.count is not None:
+            self.count_threshold = 1
+        if self.output_format and self.export_format and self.export_format != self.output_format:
+            raise ValueError("Conflicting output_format and export_format")
+        for target in self.targets:
+            TargetRequest.model_validate(target)
+        return self
 
 
 class SavedQueryRequest(BaseModel):
@@ -368,6 +441,78 @@ class SignalObservationRequest(BaseModel):
     anomaly_threshold: float = Field(0.45, ge=0, le=2)
 
 
+class TessTargetRequest(BaseModel):
+    """Exactly one TESS target identifier form."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    tic_id: str | None = Field(None, min_length=1, max_length=32, description="TESS Input Catalog identifier")
+    name: str | None = Field(None, min_length=1, max_length=300, description="Name resolved through CDS Sesame")
+    ra_deg: float | None = Field(None, ge=0, lt=360)
+    dec_deg: float | None = Field(None, ge=-90, le=90)
+
+    @field_validator("tic_id")
+    @classmethod
+    def normalize_tic_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().upper().removeprefix("TIC").strip()
+        if not normalized.isdigit():
+            raise ValueError("tic_id must contain a bare numeric TIC identifier")
+        return normalized
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_target_form(self):
+        has_coordinates = self.ra_deg is not None and self.dec_deg is not None
+        if (self.ra_deg is None) != (self.dec_deg is None):
+            raise ValueError("ra_deg and dec_deg must be supplied together")
+        forms = int(self.tic_id is not None) + int(self.name is not None) + int(has_coordinates)
+        if forms != 1:
+            raise ValueError("provide exactly one of tic_id, name, or the ra_deg/dec_deg pair")
+        return self
+
+
+class TessLightCurveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    target: TessTargetRequest
+    sectors: list[int] | None = Field(None, min_length=1, max_length=100, description="Omit to retrieve all available sectors")
+    flux_kind: Literal["SAP_FLUX", "PDCSAP_FLUX"] = "PDCSAP_FLUX"
+    radius_arcsec: float = Field(5.0, gt=0, le=3600, description="Coordinate match radius")
+
+    @field_validator("sectors")
+    @classmethod
+    def validate_sectors(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(sector <= 0 for sector in value):
+            raise ValueError("sector numbers must be positive")
+        if len(value) != len(set(value)):
+            raise ValueError("sectors must not contain duplicates")
+        return value
+
+
+class TessLightCurvePlotRequest(TessLightCurveRequest):
+    normalize: bool = False
+    show_uncertainties: bool = False
+    quality_display: Literal["highlight", "hide"] = "highlight"
+    period_days: float | None = Field(None, gt=0)
+    epoch_btjd: float | None = None
+
+    @model_validator(mode="after")
+    def validate_phase_epoch(self):
+        if self.epoch_btjd is not None and self.period_days is None:
+            raise ValueError("epoch_btjd requires period_days")
+        return self
+
+
 @app.post("/api/v1/summaries/system")
 async def system_summary_endpoint(req: SystemSummaryRequest):
     try:
@@ -386,6 +531,9 @@ async def object_summary_endpoint(req: SearchRequest):
         return object_summary(await _search(req))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ObjectResolutionError as exc:
+        code = 404 if "no coordinates found" in str(exc).lower() else 502
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/signals/cross-reference")
@@ -398,6 +546,103 @@ async def signal_cross_reference_endpoint(req: SignalObservationRequest):
         )
     except RepresentationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def get_tess_service() -> TessLightCurveService:
+    service = getattr(app.state, "tess_service", None)
+    if service is None:
+        service = TessLightCurveService(os.getenv("TESS_CACHE_DIR"))
+    return service
+
+
+async def _resolved_tess_target(target: TessTargetRequest) -> dict[str, Any]:
+    if target.tic_id is not None:
+        return {"tic_id": target.tic_id}
+    if target.name is not None:
+        client = getattr(app.state, "client", None)
+        if client is None:
+            raise TessServiceUnavailable("name resolution is unavailable outside the application lifespan")
+        settings = Settings()
+        resolved = await SesameResolver(client, endpoint=settings.resolver_endpoint).resolve(target.name)
+        return {
+            "name": target.name,
+            "ra_deg": resolved.ra_deg,
+            "dec_deg": resolved.dec_deg,
+            "resolved_object": resolved.as_dict(),
+        }
+    return {"ra_deg": target.ra_deg, "dec_deg": target.dec_deg}
+
+
+async def _retrieve_tess(req: TessLightCurveRequest) -> dict[str, Any]:
+    try:
+        target = await _resolved_tess_target(req.target)
+        return await asyncio.to_thread(
+            get_tess_service().retrieve,
+            target,
+            sectors=req.sectors,
+            flux_kind=req.flux_kind,
+            radius_arcsec=req.radius_arcsec,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ObjectResolutionError as exc:
+        message = str(exc)
+        lowered = message.lower()
+        code = 404 if "no coordinates found" in lowered else 502
+        raise HTTPException(status_code=code, detail=message) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except TessServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TessServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _render_tess_png(observations: list[dict[str, Any]], req: TessLightCurvePlotRequest, label: str) -> bytes:
+    # Matplotlib's pyplot state is process-global; serialize figure construction.
+    with _TESS_PLOT_LOCK:
+        return plot_light_curves(
+            observations,
+            show_uncertainties=req.show_uncertainties,
+            quality_display=req.quality_display,
+            normalize=req.normalize,
+            period_days=req.period_days,
+            epoch_btjd=req.epoch_btjd,
+            title=label,
+        )
+
+
+@app.post("/api/v1/signals/tess/light-curves")
+async def retrieve_tess_light_curves(req: TessLightCurveRequest):
+    """Search MAST for TESS SPOC light curves and return canonical observations."""
+    result = await _retrieve_tess(req)
+    if result["status"] == "failed":
+        raise HTTPException(status_code=502, detail={"message": "all matching MAST products failed", **result})
+    return result
+
+
+@app.post("/api/v1/signals/tess/light-curves/plot")
+async def plot_tess_light_curves(req: TessLightCurvePlotRequest):
+    """Retrieve TESS SPOC light curves and render them as a PNG image."""
+    result = await _retrieve_tess(req)
+    if not result["observations"]:
+        code = 502 if result["status"] == "failed" else 404
+        detail = {"message": "no light curves could be plotted", **result}
+        raise HTTPException(status_code=code, detail=detail)
+    try:
+        png = await asyncio.to_thread(
+            _render_tess_png,
+            result["observations"],
+            req,
+            f"TESS light curves — {req.target.tic_id or req.target.name or 'coordinate target'}",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": 'inline; filename="tess-light-curves.png"', "X-AstroSearch-Retrieval-Status": result["status"]},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +696,7 @@ async def _search(req: SearchRequest) -> dict[str, Any]:
         resolved_info = resolved.as_dict()
         ra, dec = resolved.ra_deg, resolved.dec_deg
     else:
+        assert req.ra is not None and req.dec is not None
         ra, dec = req.ra, req.dec
 
     query = AdvancedQuery.from_dict({
@@ -525,25 +771,17 @@ async def create_dataset_endpoint(req: DatasetRequest, background_tasks: Backgro
 
     engine = get_engine()
     try:
-        query = AdvancedQuery.from_dict({
-            "ra": req.targets[0].ra,
-            "dec": req.targets[0].dec,
-            "radius_arcsec": req.radius_arcsec,
-            "profiles": [req.profile],
-            "object_types": req.object_types,
-            "count_threshold": req.count_threshold,
-            "min_confidence": req.min_confidence,
-            "max_results": req.max_results,
-            "catalogs": req.catalogs,
-            "time_period": req.time_period,
-        })
-        QueryValidator.validate(query, engine.registry)
-        if req.output_path:
-            path = Path(req.output_path).resolve()
+        req.validate_registry(engine.registry)
+        selected_format = req.output_format or (None if req.export_format == "auto" else req.export_format)
+        if req.count is None:
+            selected_format = selected_format or "parquet"
+        output_path = req.output_path or req.export_path
+        if output_path:
+            path = Path(output_path).resolve()
             if (
                 not path.is_relative_to(engine.storage)
                 or path.exists()
-                or path.suffix.lower() != f".{req.export_format}"
+                or selected_format and path.suffix.lower() != f".{selected_format}"
             ):
                 raise ValueError("output_path must be unused, inside DATASET_STORAGE_PATH, and match export_format")
     except ValueError as exc:
@@ -552,12 +790,12 @@ async def create_dataset_endpoint(req: DatasetRequest, background_tasks: Backgro
     logger.info("create_dataset_request", name=req.name, profile=req.profile)
     try:
         payload = req.model_dump(exclude={"output_path", "export_format"})
-        payload["output_format"] = req.export_format
-        payload["export_path"] = req.output_path
+        payload["output_format"] = selected_format
+        payload["export_path"] = req.output_path or req.export_path
         metadata = enqueue_dataset(payload, engine)
         try:
             if not submit_to_redis(metadata["id"], payload):
-                background_tasks.add_task(process_dataset_async, metadata["id"], payload)
+                background_tasks.add_task(process_dataset_async, metadata["id"], payload, engine)
         except Exception as exc:
             metadata["status"] = "failed"
             metadata["error"] = "Job queue unavailable"
@@ -591,14 +829,27 @@ async def get_dataset_endpoint(dataset_name: str):
 
 
 @app.get("/api/v1/datasets/{dataset_name}/export")
-async def export_dataset_endpoint(dataset_name: str):
+async def export_dataset_endpoint(dataset_name: str, partition: int | None = Query(None, ge=0)):
     """Download exported dataset file or stream from object storage."""
     engine = get_engine()
     dataset = engine.get_dataset(dataset_name)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    if dataset["status"] != "completed":
+    if dataset["status"] not in {"completed", "partial"}:
         raise HTTPException(status_code=409, detail="Dataset export is not ready")
+
+    if partition is not None:
+        parts = dataset.get("partitions", [])
+        if partition >= len(parts):
+            raise HTTPException(status_code=404, detail="Partition not found")
+        path = Path(parts[partition]["path"]).resolve()
+        if not path.is_relative_to(engine.storage) or not path.is_file():
+            raise HTTPException(status_code=404, detail="Partition file not found")
+        return FileResponse(path, filename=path.name)
+    if len(dataset.get("partitions", [])) > 1:
+        return JSONResponse({"manifest": dataset["manifest_path"], "partitions": [
+            {**p, "download_url": f"/api/v1/datasets/{dataset_name}/export?partition={i}"}
+            for i, p in enumerate(dataset["partitions"])]})
 
     if dataset.get("export_uri"):
         body = engine.objects.get(dataset["export_uri"])
@@ -616,6 +867,18 @@ async def export_dataset_endpoint(dataset_name: str):
             headers={"Content-Disposition": f'attachment; filename="{dataset_name}.{dataset["output_format"]}"'},
         )
     return FileResponse(dataset["export_path"], filename=f"{dataset_name}.{dataset['output_format']}")
+
+
+@app.get("/api/v1/datasets/{dataset_name}/manifest")
+async def dataset_manifest_endpoint(dataset_name: str):
+    engine = get_engine()
+    dataset = engine.get_dataset(dataset_name)
+    if not dataset or not dataset.get("manifest_path"):
+        raise HTTPException(status_code=404, detail="Manifest not found")
+    path = Path(dataset["manifest_path"]).resolve()
+    if not path.is_relative_to(engine.storage) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Manifest not found")
+    return FileResponse(path, media_type="application/json", filename=path.name)
 
 
 @app.delete("/api/v1/datasets/{dataset_name}", status_code=status.HTTP_204_NO_CONTENT)
@@ -636,12 +899,41 @@ async def list_queries_endpoint():
     return get_metadata().list_queries()
 
 
+def _get_saved_query(query_id: str) -> dict[str, Any] | None:
+    return next((item for item in get_metadata().list_queries() if item["id"] == query_id), None)
+
+
+@app.get("/api/v1/queries/{query_id}", response_model=dict[str, Any])
+async def get_query_endpoint(query_id: str):
+    """Retrieve one saved search query, including its input definition."""
+    query = _get_saved_query(query_id)
+    if query is None:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    return query
+
+
 @app.post("/api/v1/queries", response_model=dict[str, Any], status_code=201)
 async def save_query_endpoint(req: SavedQueryRequest):
     """Save a search query for reuse."""
-    if not req.query.name and (req.query.ra is None or req.query.dec is None):
-        raise HTTPException(status_code=422, detail="Query requires name or ra and dec")
     return get_metadata().save_query(req.name, req.query.model_dump())
+
+
+@app.post("/api/v1/queries/{query_id}/run", response_model=dict[str, Any])
+async def run_saved_query_endpoint(query_id: str):
+    """Execute a saved search query using the current catalog data sources."""
+    saved = _get_saved_query(query_id)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    try:
+        request = SearchRequest.model_validate(saved["query"])
+        return await _search(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Saved query is invalid: {exc}") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("saved_query_run_error", query_id=query_id, error=str(exc))
+        raise HTTPException(status_code=502, detail="Catalog search failed") from exc
 
 
 @app.delete("/api/v1/queries/{query_id}", status_code=204)

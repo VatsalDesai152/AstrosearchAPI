@@ -16,7 +16,7 @@ from astronomy import (
     planet_summary,
     system_summary,
 )
-from astronomy_pipeline import commit_snapshot, load_json, mantis_command, map_rows, publish, relationships, state_lock
+from astronomy import commit_snapshot, load_json, mantis_command, map_rows, publish, relationships, state_lock
 
 
 def planet(name="Example b", host="Example", **extra):
@@ -170,7 +170,7 @@ def test_failed_snapshot_preserves_latest(tmp_path, monkeypatch):
     first = commit_snapshot(tmp_path, [planet()], no_match(), [])
     def fail(*args, **kwargs):
         raise OSError("disk full")
-    monkeypatch.setattr("astronomy_pipeline.map_rows", fail)
+    monkeypatch.setattr("astronomy.map_rows", fail)
     with pytest.raises(OSError):
         commit_snapshot(tmp_path, [planet(pl_orbper=8)], no_match(), [])
     assert load_json(tmp_path / "latest.json")["fingerprint"] == first["fingerprint"]
@@ -197,7 +197,7 @@ def test_publication_does_not_repeat_uncertain_write(tmp_path, monkeypatch):
     def invoke(args, **kwargs):
         calls.append(args)
         return subprocess.CompletedProcess(args, 0 if args[0] == "use" else 1, stdout="")
-    monkeypatch.setattr("astronomy_pipeline.run_mantis", invoke)
+    monkeypatch.setattr("astronomy.run_mantis", invoke)
     with pytest.raises(RuntimeError, match="uncertain"):
         publish(tmp_path)
     with pytest.raises(RuntimeError, match="uncertain"):
@@ -213,7 +213,7 @@ def test_publication_reuses_saved_space_and_marks_only_submitted(tmp_path, monke
     def invoke(args, **kwargs):
         calls.append(args)
         return subprocess.CompletedProcess(args, 0, stdout="Creation started\n" + json.dumps({"space_id": sid, "map_id": "test-map"}))
-    monkeypatch.setattr("astronomy_pipeline.run_mantis", invoke)
+    monkeypatch.setattr("astronomy.run_mantis", invoke)
     commit_snapshot(tmp_path, [planet()], no_match(), [])
     assert publish(tmp_path)["status"] == "submitted"
     assert publish(tmp_path)["status"] == "submitted"
@@ -237,7 +237,7 @@ def test_publication_can_use_valid_rest_when_mcp_is_unavailable(tmp_path, monkey
         calls.append(args)
         body = json.dumps({"space_id": "6aa1d8cf-9d4c-497b-8bed-a6337b11f4a2", "map_id": "test-map"})
         return subprocess.CompletedProcess(args, 1 if args[0] == "use" else 0, stdout=body)
-    monkeypatch.setattr("astronomy_pipeline.run_mantis", invoke)
+    monkeypatch.setattr("astronomy.run_mantis", invoke)
     commit_snapshot(tmp_path, [planet()], no_match(), [])
     assert publish(tmp_path)["status"] == "submitted"
     assert [c[0] for c in calls] == ["use", "spaces", "create"]

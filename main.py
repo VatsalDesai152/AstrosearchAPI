@@ -1,12 +1,12 @@
 """Master programmatic facade, command-line interface (CLI), and built-in offline verification suite."""
 
+
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import json
-import os
 import sys
 import tempfile
 import time
@@ -15,34 +15,65 @@ from typing import Any
 
 import httpx
 
-from crossmatch import (
+from core import (
     AdvancedQuery,
-    CrossmatchService,
-    QueryValidator,
-    angular_separation_arcsec,
-    match_score,
-    match_target,
-)
-from datasets import DatasetEngine, DatasetWriter
-from models import (
     CatalogDefinition,
     CatalogRegistry,
     CatalogSource,
+    CrossmatchService,
+    EndpointGuard,
     InvalidCoordinateError,
+    MASTProvider,
+    QueryValidator,
+    ResolvedObject,
+    SesameResolver,
     Settings,
     Target,
     UnifiedRecord,
+    angular_separation_arcsec,
+    match_score,
+    match_target,
     normalize_source_record,
     parse_ipac_records,
     parse_json_records,
+    provider_map,
     validate_target,
 )
-from providers import (
-    EndpointGuard,
-    MASTProvider,
-    SesameResolver,
-    provider_map,
-)
+from datasets import DatasetEngine, DatasetWriter
+
+# Preserve historical facade imports for programmatic callers.
+__all__ = [
+    "AdvancedQuery",
+    "CatalogDefinition",
+    "CatalogRegistry",
+    "CatalogSource",
+    "CrossmatchService",
+    "DatasetEngine",
+    "DatasetWriter",
+    "EndpointGuard",
+    "InvalidCoordinateError",
+    "MASTProvider",
+    "QueryValidator",
+    "ResolvedObject",
+    "SesameResolver",
+    "Settings",
+    "Target",
+    "UnifiedRecord",
+    "angular_separation_arcsec",
+    "build_service",
+    "catalog_definitions",
+    "crossmatch",
+    "main",
+    "match_score",
+    "match_target",
+    "normalize_source_record",
+    "parse_ipac_records",
+    "parse_json_records",
+    "provider_map",
+    "run_verification",
+    "search_object",
+    "validate_target",
+]
 
 # ---------------------------------------------------------------------------
 # Public Programmatic API
@@ -126,7 +157,7 @@ def catalog_definitions(*, settings: Settings | None = None) -> dict[str, Any]:
 
 
 def run_verification() -> bool:
-    """Run comprehensive offline test and verification suite across all 5 monoliths."""
+    """Run the offline verification suite across the seven runtime modules."""
     print("=" * 70)
     print("AstroSearch Built-In Verification Suite (Offline)")
     print("=" * 70)
@@ -203,7 +234,7 @@ def run_verification() -> bool:
 
     check("IPAC table parser (IRSA Gator)", test_ipac)
 
-    # 6. Embedded 19-Catalog Registry
+    # 6. Embedded Catalog Registry
     def test_registry():
         reg = CatalogRegistry()
         enabled = reg.enabled_catalogs()
@@ -213,7 +244,7 @@ def run_verification() -> bool:
         assert "allwise" in enabled
         assert "sdss" in enabled
 
-    check("Embedded 19-catalog registry loading", test_registry)
+    check("Embedded catalog registry loading", test_registry)
 
     # 7. CDS Sesame XML Parsing
     def test_sesame():
@@ -307,40 +338,56 @@ def run_verification() -> bool:
 
     # 11. FastAPI REST API Route Suite
     def test_api_routes():
+        import os
+        from unittest.mock import patch
+
         from fastapi.testclient import TestClient
-        from api import app
 
-        with TestClient(app) as client:
-            # Health
-            res = client.get("/api/v1/health")
-            assert res.status_code == 200
-            assert res.json()["status"] == "healthy"
+        from api import RequestQuota, app
 
-            # Catalogs
-            res = client.get("/api/v1/catalogs")
-            assert res.status_code == 200
-            assert "gaia_dr3" in res.json()
+        app.state.quota = RequestQuota()
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            offline_settings = {
+                "API_KEYS": "",
+                "JWT_SECRET": "",
+                "JWT_PUBLIC_KEY": "",
+                "REQUIRE_API_KEY": "false",
+                "REDIS_URL": "",
+                "DATASET_STORAGE_PATH": runtime_dir,
+                "DATABASE_URL": f"sqlite:///{Path(runtime_dir) / 'metadata.sqlite3'}",
+                "CATALOG_REGISTRY_PATH": "",
+            }
+            with patch.dict(os.environ, offline_settings), TestClient(app) as client:
+                # Health
+                res = client.get("/api/v1/health")
+                assert res.status_code == 200
+                assert res.json()["status"] == "healthy"
 
-            # Specific catalog
-            res = client.get("/api/v1/catalogs/gaia_dr3")
-            assert res.status_code == 200
-            assert res.json()["name"] == "gaia_dr3"
+                # Catalogs
+                res = client.get("/api/v1/catalogs")
+                assert res.status_code == 200
+                assert "gaia_dr3" in res.json()
 
-            # Saved Queries CRUD
-            post_q = client.post("/api/v1/queries", json={"name": "M87-query", "query": {"ra": 187.7, "dec": 12.39}})
-            assert post_q.status_code == 201
-            query_id = post_q.json()["id"]
+                # Specific catalog
+                res = client.get("/api/v1/catalogs/gaia_dr3")
+                assert res.status_code == 200
+                assert res.json()["name"] == "gaia_dr3"
 
-            list_q = client.get("/api/v1/queries")
-            assert list_q.status_code == 200
-            assert any(q["id"] == query_id for q in list_q.json())
+                # Saved Queries CRUD
+                post_q = client.post("/api/v1/queries", json={"name": "M87-query", "query": {"ra": 187.7, "dec": 12.39}})
+                assert post_q.status_code == 201
+                query_id = post_q.json()["id"]
 
-            del_q = client.delete(f"/api/v1/queries/{query_id}")
-            assert del_q.status_code == 204
+                list_q = client.get("/api/v1/queries")
+                assert list_q.status_code == 200
+                assert any(q["id"] == query_id for q in list_q.json())
 
-            # Stats & Monitoring
-            assert client.get("/api/v1/stats").status_code == 200
-            assert client.get("/api/v1/monitoring").status_code == 200
+                del_q = client.delete(f"/api/v1/queries/{query_id}")
+                assert del_q.status_code == 204
+
+                # Stats & Monitoring
+                assert client.get("/api/v1/stats").status_code == 200
+                assert client.get("/api/v1/monitoring").status_code == 200
 
     check("FastAPI REST endpoints and lifecycle", test_api_routes)
 
@@ -382,8 +429,15 @@ def main() -> None:
     dataset_parser.add_argument("--name", required=True, help="Dataset identification name")
     dataset_parser.add_argument("--profile", required=True, help="Catalog profile (e.g. stellar, optical)")
     dataset_parser.add_argument("--radius", type=float, default=5.0, help="Search radius in arcseconds")
-    dataset_parser.add_argument("--targets", required=True, help="Path to JSON file containing array of targets")
-    dataset_parser.add_argument("--format", choices=["parquet", "csv", "json", "fits"], default="parquet")
+    dataset_parser.add_argument("--targets", help="Path to JSON file containing array of targets")
+    dataset_parser.add_argument("--format", choices=["auto", "parquet", "csv", "json", "jsonl", "fits"])
+    dataset_parser.add_argument("--count", type=int, help="Usable object count; enables canonical record reuse")
+    dataset_parser.add_argument("--catalogs", nargs="+", help="Catalog names")
+    dataset_parser.add_argument("--fields", nargs="+", help="Required fields, optionally catalog.field")
+    dataset_parser.add_argument("--products", nargs="+", choices=["tess_light_curve"])
+    dataset_parser.add_argument("--filters", type=json.loads, help="JSON field filters")
+    dataset_parser.add_argument("--quality-constraints", type=json.loads, help="JSON quality filters")
+    dataset_parser.add_argument("--intended-use", choices=["table", "astronomy", "analysis"], default="table")
     dataset_parser.add_argument("--output", help="Explicit path to write the dataset export")
 
     # Command: catalogs
@@ -432,11 +486,13 @@ def main() -> None:
         asyncio.run(do_search())
 
     elif args.command == "dataset":
-        targets_file = Path(args.targets)
-        if not targets_file.exists():
+        if not args.targets and args.count is None:
+            parser.error("dataset requires --targets or --count")
+        targets_file = Path(args.targets) if args.targets else None
+        if targets_file and not targets_file.exists():
             print(f"Error: Targets file '{args.targets}' not found.")
             sys.exit(1)
-        targets_data = json.loads(targets_file.read_text(encoding="utf-8"))
+        targets_data = json.loads(targets_file.read_text(encoding="utf-8")) if targets_file else []
 
         async def do_dataset():
             engine = DatasetEngine()
@@ -445,11 +501,13 @@ def main() -> None:
                 name=args.name,
                 profile=args.profile,
                 radius_arcsec=args.radius,
-                output_format=args.format,
+                output_format=None if args.format == "auto" else args.format,
                 export_path=args.output,
                 targets=targets_data,
+                count=args.count, catalogs=args.catalogs, fields=args.fields, products=args.products,
+                filters=args.filters, quality_constraints=args.quality_constraints, intended_use=args.intended_use,
             )
-            print(f"Dataset generated successfully: {meta['export_path']}")
+            print(f"Dataset {meta['status']}: {meta['export_path']}")
             print(f"Total sources written: {meta['total_sources']}")
 
         asyncio.run(do_dataset())

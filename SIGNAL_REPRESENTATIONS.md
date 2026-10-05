@@ -2,6 +2,8 @@
 
 This design turns Vatsal's proposal into a testable pipeline. It accepts calibrated light curves and spectra, creates a fixed representation, cross-references each observation against known objects, and emits a typed vector row for a dedicated Mantis map. It calls unusual observations **novelty-review candidates**, never discoveries.
 
+**Implementation status:** the repository can retrieve and plot public TESS SPOC light curves from MAST. The representation and cross-reference code can process canonical observations supplied to it, including spectra, but this checkout does not include general archive retrieval for spectra or image media. Mantis vector-map export is a separate workflow; it does not turn this pipeline into a multi-archive media browser. See the [technical capability and frontend guide](DOCUMENTATION.md#media-plotting--frontend-integration).
+
 ## Why this needs a separate ingestion path
 
 Catalog rows and text summaries describe known objects. A light curve or spectrum is an ordered measurement with uncertainty, missing samples, instrument artifacts, and an axis with physical units. Flattening these arrays into prose destroys the evidence needed for comparison. The signal path therefore preserves the original observation and constructs a versioned numeric representation beside it.
@@ -34,9 +36,9 @@ two independent comparisons
 triage status + immutable evidence bundle + Mantis vector row
 ```
 
-`representations.py` implements the deterministic baseline. It sorts the physical axis, rejects unusable input, applies quality flags, uses uncertainties in the trend estimate, robustly scales the signal, and records its usable-sample fraction. Spectral binning uses log wavelength when all wavelengths are positive. Every vector is unit-normalized and tagged `astrosearch-signal-v1`; incompatible versions must not be compared.
+`signals.py` implements the deterministic baseline. It sorts the physical axis, rejects unusable input, applies quality flags, uses uncertainties in the trend estimate, robustly scales the signal, and records its usable-sample fraction. Spectral binning uses log wavelength when all wavelengths are positive. Every vector is unit-normalized and tagged `astrosearch-signal-v1`; incompatible versions must not be compared.
 
-`signal_pipeline.py` accepts newline-delimited JSON deliveries, rejects conflicting duplicate observation IDs, produces an immutable fingerprinted snapshot, and writes:
+`signals.py` accepts newline-delimited JSON deliveries, rejects conflicting duplicate observation IDs, produces an immutable fingerprinted snapshot, and writes:
 
 - `delivery.json`: original canonical observations and thresholds;
 - `cross-reference-results.json`: ranked evidence and review requirements;
@@ -78,7 +80,7 @@ Every reference vector must include its `modality` and `representation_version`.
 
 The adapter, rather than the representation function, owns mission-specific decisions. For TESS it must preserve the sector and distinguish SAP from PDCSAP. For NEOWISE it must preserve W1/W2, upper limits, `cc_flags`, SNR, reduced chi-squared, frame identifiers, and the observation epoch. Spectra must preserve wavelength frame, flux convention, spectral resolution, calibration level, redshift/rest-frame treatment, and masks.
 
-`tess_adapter.py` implements the first mission adapter for SPOC light-curve FITS files. It supports SAP and PDCSAP explicitly and preserves the full quality array, uncertainty array, sector, detector, pipeline version, units, archive URL, and original product name.
+`tess.py` implements the first mission adapter for SPOC light-curve FITS files. It supports SAP and PDCSAP explicitly and preserves the full quality array, uncertainty array, sector, detector, pipeline version, units, archive URL, and original product name.
 
 ## Cross-reference states
 

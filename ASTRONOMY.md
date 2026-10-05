@@ -6,9 +6,9 @@ This extension adds catalog-grounded object and extrasolar-system summaries, a f
 
 ## AstroSearch Observatory dashboard
 
-The repository includes a packaged Mantis dashboard extension under `mantis-extension/astrosearch-observatory`. It provides a polished entry point for the 50,000-record Mega Atlas, semantic catalog, ICRS sky atlas, and TESS signal map. The dashboard exposes the curated Gaia review queues and scientific views while keeping the interpretation boundary explicit: proximity, variability, and representation similarity identify candidates for human review; they do not establish discovery.
+The `mantis-extension/astrosearch-observatory` directory is only a manifest and README scaffold in this checkout. It does not contain panel source or a built dashboard bundle, and it does not provide a live Mega Atlas, sky atlas, or TESS signal map. The astronomy snapshot, summary, and publication workflows described here are backend/CLI capabilities. Proximity, variability, and representation similarity identify candidates for human review; they do not establish discovery.
 
-Package that directory as a `.mantisx` ZIP with `mantis.extension.json` at the archive root, then install it in a space with the Mantis extension manager or CLI. The extension requests only `maps:read` and `selection:read`; it has no backend, network access, or data-write permission.
+The manifest currently lists `maps:read` and `selection:read`; it has no network permission and cannot call the AstroSearch API. Implement and build the panel, then follow the host's extension packaging and network-permission requirements before treating this directory as an installable dashboard. The [main technical documentation](DOCUMENTATION.md#media-plotting--frontend-integration) describes the current AstroSearch API integration boundary.
 
 ## Install and summarize
 
@@ -16,9 +16,9 @@ Use Python 3.12 or later in a virtual environment:
 
 ```sh
 pip install -e '.[dev]'
-python -m astronomy_pipeline summarize TRAPPIST-1
-python -m astronomy_pipeline summarize 'TRAPPIST-1 b'
-python -m astronomy_pipeline summarize-object M87 --profile optical
+python -m astronomy summarize TRAPPIST-1
+python -m astronomy summarize 'TRAPPIST-1 b'
+python -m astronomy summarize-object M87 --profile optical
 python main.py serve
 ```
 
@@ -40,7 +40,7 @@ System errors: 404 for no matching archive entry, 422 for invalid input, 502 for
 ## Build the complete dataset
 
 ```sh
-python -m astronomy_pipeline sync --state-dir astronomy-data
+python -m astronomy sync --state-dir astronomy-data
 ```
 
 This fetches all rows in `pscomppars` and resolves the host identifiers against SIMBAD in batches of 100. The implementation queries the live column schema, requests a complete bounded table, and verifies the row count and uniqueness. NASA's service can apply `TOP` before ordering, so name-keyset pagination is deliberately avoided. Snapshots are limited to 100,000 planets and 64 MiB per TAP response; exceeding either limit fails explicitly. This is a complete exoplanet catalog and its relevant SIMBAD host subset, **not a mirror of all SIMBAD objects**.
@@ -69,8 +69,8 @@ Install the MIT CSAIL CLI and authenticate locally. Never commit or paste creden
 npm install -g mantisai-cli@3.7.0
 mantis setup
 mantis use get_space_context
-python -m astronomy_pipeline publish --state-dir astronomy-data --dry-run
-python -m astronomy_pipeline publish --state-dir astronomy-data
+python -m astronomy publish --state-dir astronomy-data --dry-run
+python -m astronomy publish --state-dir astronomy-data
 ```
 
 The first publication creates a space called **Astronomical Catalogs** using the CLI's `--private` option. The current server reports this visibility as `unlisted`; consult Mantis sharing controls before treating a link as restricted access. Subsequent changed snapshots are new versioned maps in that same space. To use an existing destination, pass its real UUID with `--space-id`. The publisher does not change the current Mantis space/thread selection.
@@ -90,12 +90,12 @@ Useful map explorations include filtering `kind=planet`, grouping by `discovery_
 For a continuously running local worker:
 
 ```sh
-python -m astronomy_pipeline watch --state-dir astronomy-data --interval-hours 24 --publish
+python -m astronomy watch --state-dir astronomy-data --interval-hours 24 --publish
 ```
 
 The first cycle runs immediately. Later cycles refetch both sources, capture additions/deletions/measurement changes, and publish only snapshots without an existing submitted checkpoint. All publications stay in the saved space. Failures are logged and retried on the next interval; the last successful snapshot remains available. Keep this process running under your chosen service manager; stop it with Ctrl+C. The code does not install a system service automatically.
 
-`.github/workflows/astronomy.yml` runs offline checks on pushes and pull requests, and downloads fresh catalog snapshots daily at 06:23 UTC or on manual dispatch. It retains artifacts for 30 days and restores prior snapshot state from Actions cache for change detection. Cache eviction can lose historical comparison state; download artifacts for durable archival needs. The hosted workflow does not upload to Mantis or store Mantis credentials. The local authenticated watcher handles that step. GitHub scheduling starts only after the workflow is on the repository's default branch with Actions enabled.
+`.github/workflows/astronomy.yml` runs offline lint, unit, and verification checks on pushes, pull requests, and manual dispatch. It does not fetch archive snapshots or publish to Mantis. Use the local `sync` and `watch` commands above when you want to make archive requests; the hosted workflow does not store Mantis credentials.
 
 ## Scientific interpretation
 
@@ -110,7 +110,7 @@ The first cycle runs immediately. Later cycles refetch both sources, capture add
 
 ```sh
 python -m pytest tests -q
-python -m ruff check astronomy.py astronomy_pipeline.py tests
+python -m ruff check core.py datasets.py api.py main.py astronomy.py signals.py tess.py tests
 python main.py verify
 ```
 
